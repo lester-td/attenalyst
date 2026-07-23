@@ -33,3 +33,7 @@ htmlcov/
 # Local data files
 *.sqlite*
 *.csv
+
+# Environment variables
+.env.local
+.env
