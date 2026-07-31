@@ -1,0 +1,9 @@
+aiosqlite==0.20.0
+fastapi>=0.115,<1
+Jinja2>=3.1,<4
+python-dateutil>=2.9,<3
+python-dotenv>=1.0,<2
+python-multipart>=0.0.9,<1
+python-telegram-bot[job-queue]==21.6
+tzdata>=2024.1
+uvicorn[standard]>=0.30,<1

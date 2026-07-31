@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}{{ event.name }} · Attenalyst{% endblock %}
+{% block content %}
+  {% if delivered is not none %}
+    <div class="notice">Event published. Delivered to {{ delivered }} of {{ attempted }} contactable members.</div>
+  {% endif %}
+  {% if not event.active %}
+    <div class="alert">This event is deleted. Reminders are stopped and it is hidden from members, but its responses are retained.</div>
+  {% endif %}
+  <section class="hero compact">
+    <div>
+      <p class="eyebrow">Event #{{ event.id }}</p>
+      <h1>{{ event.name }}</h1>
+      <p class="lede">{{ event.venue }} · {{ event.start_at[:16].replace('T', ' ') }}</p>
+    </div>
+    <div class="hero-actions">
+      <a class="button button-secondary" href="/events/{{ event.id }}/export">Export CSV</a>
+      {% if event.active %}
+        <form action="/events/{{ event.id }}/delete" method="post" onsubmit="return confirm('Delete this event? Reminders will stop immediately.');">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
+          <button class="button button-danger" type="submit">Delete event</button>
+        </form>
+      {% else %}
+        <form action="/events/{{ event.id }}/restore" method="post">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
+          <button class="button" type="submit">Restore event</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="stats">
+    <article><strong>{{ responses|length }}</strong><span>Members tracked</span></article>
+    <article><strong>{{ complete }}</strong><span>Complete</span></article>
+    <article><strong>{{ groups.no_response|length }}</strong><span>No response</span></article>
+    <article><strong>{{ groups.kiv|length }}</strong><span>KIV</span></article>
+  </section>
+
+  <section class="issue-grid">
+    {% set sections = [
+      ('No response', groups.no_response),
+      ('KIV', groups.kiv),
+      ('Form not acknowledged', groups.missing_form),
+      ('Reason missing', groups.missing_reason),
+      ('Unreachable', groups.unreachable)
+    ] %}
+    {% for title, rows in sections %}
+      <article class="panel issue-card">
+        <div class="section-heading"><h2>{{ title }}</h2><span class="pill">{{ rows|length }}</span></div>
+        {% if rows %}
+          <ul>{% for row in rows %}<li><strong>{{ row.name }}</strong><small>{{ row.member_id }}</small></li>{% endfor %}</ul>
+        {% else %}<p class="muted">Nobody in this category.</p>{% endif %}
+      </article>
+    {% endfor %}
+  </section>
+{% endblock %}

@@ -9,6 +9,11 @@ venv/
 env/
 ENV/
 
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
 # Packaging and build output
 build/
 dist/
@@ -33,6 +38,10 @@ htmlcov/
 # Local data files
 *.sqlite*
 *.csv
+!*.example.csv
+
+# Logs
+*.log
 
 # Environment variables
 .env.local

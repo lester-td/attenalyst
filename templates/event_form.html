@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Create event · Attenalyst{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">New event</p>
+    <h1>Create and notify</h1>
+    <p>Publishing creates a response record for every active member and messages everyone who has started the bot.</p>
+  </section>
+
+  {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+
+  <form class="event-form panel" action="/events" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <label class="span-2">Event name<input name="name" required minlength="3" value="{{ values.name or '' }}"></label>
+    <label>Starts<input type="datetime-local" name="start_at" required value="{{ values.start_at }}"></label>
+    <label>Ends<input type="datetime-local" name="end_at" required value="{{ values.end_at }}"></label>
+    <label>RSVP deadline<input type="datetime-local" name="rsvp_deadline" required value="{{ values.rsvp_deadline }}"></label>
+    <label>Venue<input name="venue" required value="{{ values.venue or '' }}"></label>
+    <label class="span-2">Description<textarea name="description" required rows="5">{{ values.description or '' }}</textarea></label>
+    <label class="span-2">Items to bring<input name="items_to_bring" value="{{ values.items_to_bring or '' }}" placeholder="Optional"></label>
+    <label class="check span-2"><input type="checkbox" name="form_required" {% if values.form_required %}checked{% endif %}><span>Coming members must acknowledge a registration form</span></label>
+    <label class="span-2">Registration form URL<input type="url" name="form_url" value="{{ values.form_url or '' }}" placeholder="https://…"></label>
+    <label class="check span-2"><input type="checkbox" name="decline_reason_required" {% if values.decline_reason_required %}checked{% endif %}><span>Not Coming members must provide a reason</span></label>
+    <div class="form-actions span-2">
+      <a class="button button-secondary" href="/">Cancel</a>
+      <button class="button" type="submit">Publish and notify</button>
+    </div>
+  </form>
+{% endblock %}

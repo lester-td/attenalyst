@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Attenalyst{% endblock %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">{{ settings.group_name }}</p>
+      <h1>Attendance, without the spreadsheet chase.</h1>
+      <p class="lede">Create events, follow incomplete member flows, and let Attenalyst handle reminders.</p>
+    </div>
+    <a class="button" href="/events/new">Create an event</a>
+  </section>
+
+  <section class="stats" aria-label="Roster status">
+    <article><strong>{{ roster.total }}</strong><span>Active members</span></article>
+    <article><strong>{{ roster.contactable }}</strong><span>Contactable</span></article>
+    <article><strong>{{ roster.not_started }}</strong><span>Need to start bot</span></article>
+    <article><strong>{{ roster.unlinked }}</strong><span>Unlinked</span></article>
+  </section>
+
+  <section class="panel">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Events</p>
+        <h2>Recent activity</h2>
+      </div>
+    </div>
+    {% if events %}
+      <div class="event-list">
+        {% for event in events %}
+          <a class="event-row" href="/events/{{ event.id }}">
+            <span>
+              <strong>{{ event.name }}</strong>
+              <small>{{ event.venue }}</small>
+            </span>
+            <time>{{ event.start_at[:16].replace('T', ' ') }}</time>
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state">No events yet. Create the first one when your roster is ready.</div>
+    {% endif %}
+  </section>
+
+  {% if archived_events %}
+    <section class="panel archived-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Archive</p>
+          <h2>Deleted events</h2>
+        </div>
+      </div>
+      <div class="event-list">
+        {% for event in archived_events %}
+          <a class="event-row" href="/events/{{ event.id }}">
+            <span><strong>{{ event.name }}</strong><small>Deleted · responses retained</small></span>
+            <time>{{ event.start_at[:16].replace('T', ' ') }}</time>
+          </a>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

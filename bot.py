@@ -1,1220 +1,730 @@
-"""
-PDIG Telegram Bot (Polling MVP) — Admin-gated menu + Event wizard + RSVP + Form Filled tracking + Roster import (name,username,id)
+from __future__ import annotations
 
-Install:
-  pip install python-telegram-bot==21.6 aiosqlite python-dateutil
-
-Run (PowerShell):
-  $env:TELEGRAM_BOT_TOKEN="PASTE_TOKEN"
-  $env:PDIG_ADMIN_PASSWORD="yourpassword"
-  py pdig_bot.py
-
-Roster Import:
-  1) /admin <password>
-  2) /import_members
-  3) Upload CSV as Document with columns (header required):
-       name,username,id
-     - username without @ (optional ok)
-     - id is the Telegram numeric user_id (required)
-Notes:
-  - Bot still cannot DM users until they /start the bot at least once (Telegram rule).
-  - Enrollment: when user runs /start => enrolled=1.
-"""
-
-import asyncio
 import csv
+import html
 import io
 import logging
-import os
 import re
-import sys
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone, time as dtime
 
-import aiosqlite
 from dateutil import parser as dtparser
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
+    InputFile,
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
 
-# -------------------- logging --------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("pdig-bot")
-
-# -------------------- config --------------------
-DB_PATH = "pdig_bot.sqlite3"
-SG_TZ = timezone(timedelta(hours=8))  # Asia/Singapore
-
-STATUS_NONE = "NONE"
-STATUS_COMING = "COMING"
-STATUS_NOT_COMING = "NOT_COMING"
-STATUS_KIV = "KIV"
-
-SIGNUP_DEADLINE_DAYS_BEFORE = 2
-DOORS_OPEN_MINUTES_BEFORE = 30
-
-# Reminders
-QUIET_HOURS_START = 22  # 22:00
-QUIET_HOURS_END = 9     # 09:00
-
-KIV_NUDGE_EVERY = timedelta(hours=12)
-FORM_NUDGE_EVERY = timedelta(hours=12)
-
-# Menu buttons (admin only)
-BTN_CREATE = "Create Event"
-BTN_NOREPLY = "No Reply"
-BTN_EXPORT = "Export CSV"
-BTN_HELP = "Help"
-BTN_UNENROLLED = "Un-enrolled users"
-
-ADMIN_MENU = ReplyKeyboardMarkup(
-    [[BTN_CREATE, BTN_NOREPLY],
-     [BTN_EXPORT, BTN_UNENROLLED],
-     [BTN_HELP]],
-    resize_keyboard=True,
-    one_time_keyboard=False,
+from app_config import Settings
+from database import Database
+from models import RosterRow, STATUS_COMING, STATUS_KIV, STATUS_NONE, STATUS_NOT_COMING
+from services import (
+    classify_outstanding,
+    event_csv,
+    form_keyboard,
+    in_quiet_hours,
+    now_local,
+    reminder_is_due,
+    reminder_kind,
+    render_event,
+    rsvp_keyboard,
 )
 
-# -------------------- wizard states --------------------
-(
-    CE_NAME,
-    CE_DATE,
-    CE_TIME_START,
-    CE_TIME_END,
-    CE_VENUE,
-    CE_DESC,
-    CE_ITEMS,
-    CE_LINK,
-    CE_CONFIRM,
-) = range(9)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("attenalyst.bot")
+
+SETTINGS = Settings.from_env()
+DATABASE = Database(SETTINGS.database_path)
 
 
-@dataclass
-class DraftEvent:
-    name: str = ""
-    date_str: str = ""
-    start_time_str: str = ""
-    end_time_str: str = ""
-    venue: str = ""
-    description: str = ""
-    items_to_bring: str = ""
-    signup_url: str = ""
+def is_bootstrap_admin(telegram_user_id: int) -> bool:
+    return int(telegram_user_id) in SETTINGS.admin_telegram_ids
 
 
-# -------------------- helpers --------------------
-def now_sg() -> datetime:
-    return datetime.now(tz=SG_TZ)
+async def require_private(update: Update) -> bool:
+    if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
+        return True
+    if update.effective_message:
+        await update.effective_message.reply_text("Please use this command in a private chat with me.")
+    return False
 
 
-def in_quiet_hours(dt: datetime) -> bool:
-    h = dt.hour
-    return (QUIET_HOURS_START <= h) or (h < QUIET_HOURS_END)
+async def require_admin(update: Update) -> bool:
+    if update.effective_user and is_bootstrap_admin(update.effective_user.id):
+        return True
+    if update.effective_message:
+        await update.effective_message.reply_text("Administrator access is required.")
+    return False
 
 
-def parse_date(date_str: str):
-    return dtparser.parse(date_str, dayfirst=False, yearfirst=True).date()
-
-
-def parse_time_flexible(time_str: str) -> dtime:
-    """
-    Accepts:
-      7pm, 7PM, 7 pm, 7 PM
-      1900, 19:00, 19 00
-    """
-    s = (time_str or "").strip()
-    if not s:
-        raise ValueError("Empty time")
-
-    s_norm = re.sub(r"\s+", " ", s).strip()
-
-    digits = re.sub(r"[^0-9]", "", s_norm)
-    if digits.isdigit() and len(digits) == 4:
-        hh = int(digits[:2])
-        mm = int(digits[2:])
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return dtime(hour=hh, minute=mm)
-
-    t = dtparser.parse(s_norm, fuzzy=True).time()
-    return t.replace(second=0, microsecond=0)
-
-
-def build_dt(date_str: str, time_str: str) -> datetime:
-    d = parse_date(date_str)
-    t = parse_time_flexible(time_str)
-    return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=SG_TZ)
-
-
-def fmt_time_ampm(dt: datetime) -> str:
-    # "7 PM" or "6.30PM" style
-    h = dt.hour
-    m = dt.minute
-    ampm = "AM" if h < 12 else "PM"
-    h12 = h % 12 or 12
-    if m == 0:
-        return f"{h12} {ampm}"
-    return f"{h12}.{m:02d}{ampm}"
-
-
-def fmt_date_long(dt: datetime) -> str:
-    # "Monday 9 Feb 2026"
-    return dt.strftime("%A") + f" {dt.day} " + dt.strftime("%b %Y")
-
-
-def a_or_an(name: str) -> str:
-    s = (name or "").strip().lower()
-    return "an" if (s and s[0] in "aeiou") else "a"
-
-
-def signup_deadline_date(start_at: datetime) -> datetime.date:
-    return (start_at - timedelta(days=SIGNUP_DEADLINE_DAYS_BEFORE)).date()
-
-
-def event_inline_kb(event_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Coming", callback_data=f"rsvp:{event_id}:{STATUS_COMING}"),
-            InlineKeyboardButton("Not Coming", callback_data=f"rsvp:{event_id}:{STATUS_NOT_COMING}"),
-            InlineKeyboardButton("KIV", callback_data=f"rsvp:{event_id}:{STATUS_KIV}"),
-        ]]
+async def linked_member(update: Update, *, notify: bool = True) -> dict | None:
+    user = update.effective_user
+    if user is None:
+        return None
+    member = await DATABASE.mark_bot_started(
+        user.id,
+        user.username,
+        user.full_name,
+        now_local(SETTINGS),
     )
+    if member is None and notify and update.effective_message:
+        await update.effective_message.reply_text(
+            f"Your Telegram account is not linked yet. Use /link and enter your {SETTINGS.member_id_label}."
+        )
+    return member
 
 
-def confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Publish", callback_data="ce:confirm"),
-            InlineKeyboardButton("Cancel", callback_data="ce:cancel"),
-        ]]
+async def complete_link(update: Update, member_id: str) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return False
+    if not SETTINGS.allow_self_link:
+        await message.reply_text(
+            f"Self-linking is disabled. Please contact {SETTINGS.support_contact}.\n"
+            f"Your Telegram user ID is: {user.id}"
+        )
+        return False
+
+    result = await DATABASE.claim_member(
+        member_id,
+        user.id,
+        user.username,
+        user.full_name,
+        now_local(SETTINGS),
     )
-
-
-def form_filled_kb(event_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Form Filled", callback_data=f"formfilled:{event_id}")]]
-    )
-
-
-def html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def render_event_message(d: DraftEvent, start_at: datetime, end_at: datetime) -> str:
-    doors_open = start_at - timedelta(minutes=DOORS_OPEN_MINUTES_BEFORE)
-    deadline = signup_deadline_date(start_at)
-
-    msg = (
-        f"Hello members! We will be holding {a_or_an(d.name)} <b>{html_escape(d.name)}</b>.\n\n"
-        f"{html_escape(d.description)}\n\n"
-        f"📅 <b>Date &amp; Time:</b> {html_escape(fmt_date_long(start_at))}, {html_escape(fmt_time_ampm(start_at))} "
-        f"to {html_escape(fmt_time_ampm(end_at))} (doors open {html_escape(fmt_time_ampm(doors_open))})\n"
-        f"📍 <b>Location:</b> {html_escape(d.venue)}\n"
-        f"🎒 <b>Items to bring:</b> {html_escape(d.items_to_bring)}\n\n"
-        f"Sign up by {deadline.day} {deadline.strftime('%b')}!\n"
-    )
-    return msg
-
-
-# -------------------- database --------------------
-async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Roster: expected membership (from CSV). Uses Telegram numeric user_id as PRIMARY KEY.
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS roster (
-                telegram_user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                name TEXT NOT NULL,
-                created_at TEXT
-            )
-            """
+    if result.status == "not_found":
+        await message.reply_text(
+            f"That {SETTINGS.member_id_label} is not on the active roster. Check it and try again, "
+            f"or contact {SETTINGS.support_contact}."
         )
-
-        # Members: people who have interacted with bot. enrolled=1 after /start.
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS members (
-                telegram_user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                is_admin INTEGER DEFAULT 0,
-                enrolled INTEGER DEFAULT 0,
-                enrolled_at TEXT,
-
-                roster_username TEXT,
-                roster_name TEXT,
-
-                created_at TEXT
-            )
-            """
+        return False
+    if result.status == "claimed":
+        await message.reply_text(
+            f"That identity is already linked to another Telegram account. Contact {SETTINGS.support_contact} "
+            "to have it unlinked first."
         )
-
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                start_at TEXT NOT NULL,
-                end_at TEXT NOT NULL,
-                venue TEXT NOT NULL,
-                description TEXT NOT NULL,
-                items_to_bring TEXT NOT NULL,
-                signup_url TEXT,
-                created_by INTEGER,
-                created_at TEXT
-            )
-            """
+        return False
+    if result.status == "already_linked":
+        await message.reply_text(
+            f"This Telegram account is already linked to {result.member['name']}. Use /whoami to check it."
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS responses (
-                event_id INTEGER,
-                telegram_user_id INTEGER,
-                status TEXT DEFAULT 'NONE',
-                reason_text TEXT,
+        return True
 
-                form_filled INTEGER DEFAULT 0,
-                last_form_nudge_at TEXT,
-
-                last_kiv_nudge_at TEXT,
-                updated_at TEXT,
-
-                PRIMARY KEY (event_id, telegram_user_id)
-            )
-            """
-        )
-        await db.commit()
-
-
-async def upsert_member(user_id: int, username: str | None, full_name: str | None):
-    username_norm = (username or "").lstrip("@").strip() or None
-
-    roster_name = None
-    roster_username = None
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COALESCE(username,''), name FROM roster WHERE telegram_user_id = ?",
-            (int(user_id),),
-        ) as cur:
-            row = await cur.fetchone()
-            if row:
-                roster_username = (row[0] or "").strip() or None
-                roster_name = (row[1] or "").strip() or None
-
-        await db.execute(
-            """
-            INSERT INTO members (telegram_user_id, username, full_name, roster_username, roster_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(telegram_user_id) DO UPDATE SET
-                username = excluded.username,
-                full_name = COALESCE(excluded.full_name, members.full_name),
-                roster_username = COALESCE(excluded.roster_username, members.roster_username),
-                roster_name = COALESCE(excluded.roster_name, members.roster_name)
-            """,
-            (int(user_id), username_norm, full_name, roster_username, roster_name, now_sg().isoformat()),
-        )
-        await db.commit()
-
-
-async def set_enrolled(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE members SET enrolled=1, enrolled_at=? WHERE telegram_user_id=?",
-            (now_sg().isoformat(), int(user_id)),
-        )
-        await db.commit()
-
-
-async def set_admin(user_id: int, is_admin_val: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE members SET is_admin=? WHERE telegram_user_id=?", (is_admin_val, int(user_id)))
-        await db.commit()
-
-
-async def is_admin(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT is_admin FROM members WHERE telegram_user_id=?", (int(user_id),)) as cur:
-            row = await cur.fetchone()
-            return bool(row and int(row[0]) == 1)
-
-
-async def list_enrolled_member_ids() -> list[int]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT telegram_user_id FROM members WHERE enrolled=1") as cur:
-            rows = await cur.fetchall()
-            return [int(r[0]) for r in rows]
-
-
-async def list_unenrolled_roster_rows():
-    """
-    Returns roster rows where user has NOT enrolled (/start) yet.
-    Output: [(name, username), ...]
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT r.name, COALESCE(r.username,'')
-            FROM roster r
-            LEFT JOIN members m ON m.telegram_user_id = r.telegram_user_id
-            WHERE m.telegram_user_id IS NULL OR COALESCE(m.enrolled,0)=0
-            ORDER BY r.name
-            """
-        ) as cur:
-            return await cur.fetchall()
-
-
-async def ensure_response_row(event_id: int, user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO responses (event_id, telegram_user_id, status, updated_at)
-            VALUES (?, ?, 'NONE', ?)
-            ON CONFLICT(event_id, telegram_user_id) DO NOTHING
-            """,
-            (int(event_id), int(user_id), now_sg().isoformat()),
-        )
-        await db.commit()
-
-
-async def set_status(event_id: int, user_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO responses (event_id, telegram_user_id, status, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(event_id, telegram_user_id) DO UPDATE SET
-                status=excluded.status,
-                updated_at=excluded.updated_at
-            """,
-            (int(event_id), int(user_id), status, now_sg().isoformat()),
-        )
-        await db.commit()
-
-
-async def set_reason(event_id: int, user_id: int, reason: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            UPDATE responses
-            SET reason_text=?, updated_at=?
-            WHERE event_id=? AND telegram_user_id=?
-            """,
-            (reason, now_sg().isoformat(), int(event_id), int(user_id)),
-        )
-        await db.commit()
-
-
-async def mark_form_filled(event_id: int, user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            UPDATE responses
-            SET form_filled=1, updated_at=?
-            WHERE event_id=? AND telegram_user_id=?
-            """,
-            (now_sg().isoformat(), int(event_id), int(user_id)),
-        )
-        await db.commit()
-
-
-async def get_event(event_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT id, name, start_at, end_at, venue, description, items_to_bring, signup_url
-            FROM events
-            WHERE id=?
-            """,
-            (int(event_id),),
-        ) as cur:
-            return await cur.fetchone()
-
-
-async def list_recent_events(limit: int = 10):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, name, start_at FROM events ORDER BY id DESC LIMIT ?",
-            (int(limit),),
-        ) as cur:
-            return await cur.fetchall()
-
-
-async def get_event_responses(event_id: int):
-    """
-    Returns rows:
-      name, username, telegram_user_id, status, reason, form_filled
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT
-                COALESCE(m.roster_name, m.full_name, ''),
-                COALESCE(m.username,''),
-                m.telegram_user_id,
-                r.status,
-                COALESCE(r.reason_text,''),
-                COALESCE(r.form_filled,0)
-            FROM responses r
-            JOIN members m ON m.telegram_user_id = r.telegram_user_id
-            WHERE r.event_id=?
-            ORDER BY COALESCE(m.roster_name, m.full_name, m.username)
-            """,
-            (int(event_id),),
-        ) as cur:
-            return await cur.fetchall()
-
-
-async def set_last_kiv_nudge(event_id: int, user_id: int, when: datetime):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE responses SET last_kiv_nudge_at=? WHERE event_id=? AND telegram_user_id=?",
-            (when.isoformat(), int(event_id), int(user_id)),
-        )
-        await db.commit()
-
-
-async def set_last_form_nudge(event_id: int, user_id: int, when: datetime):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE responses SET last_form_nudge_at=? WHERE event_id=? AND telegram_user_id=?",
-            (when.isoformat(), int(event_id), int(user_id)),
-        )
-        await db.commit()
-
-
-async def get_kiv_targets(event_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT telegram_user_id, COALESCE(last_kiv_nudge_at,'')
-            FROM responses
-            WHERE event_id=? AND status='KIV'
-            """,
-            (int(event_id),),
-        ) as cur:
-            return await cur.fetchall()
-
-
-async def get_form_targets(event_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT telegram_user_id, COALESCE(last_form_nudge_at,'')
-            FROM responses
-            WHERE event_id=? AND status='COMING' AND COALESCE(form_filled,0)=0
-            """,
-            (int(event_id),),
-        ) as cur:
-            return await cur.fetchall()
-
-
-async def roster_upsert_many(rows: list[tuple[int, str, str]]) -> int:
-    """
-    rows: [(telegram_user_id, username, name)]
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        count = 0
-        for telegram_user_id, username, name in rows:
-            try:
-                tid = int(telegram_user_id)
-            except Exception:
-                continue
-
-            u = (username or "").lstrip("@").strip()
-            n = (name or "").strip()
-            if not n:
-                continue
-
-            await db.execute(
-                """
-                INSERT INTO roster (telegram_user_id, username, name, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(telegram_user_id) DO UPDATE SET
-                    username=excluded.username,
-                    name=excluded.name
-                """,
-                (tid, u, n, now_sg().isoformat()),
-            )
-            count += 1
-        await db.commit()
-        return count
-
-
-# -------------------- commands --------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    await upsert_member(u.id, u.username, u.full_name)
-    await set_enrolled(u.id)
-
-    # Try to greet using roster_name if available
-    display_name = None
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COALESCE(roster_name,''), COALESCE(full_name,''), COALESCE(username,'') FROM members WHERE telegram_user_id=?",
-            (int(u.id),),
-        ) as cur:
-            row = await cur.fetchone()
-
-    if row:
-        roster_name, full_name, username = row
-        roster_name = (roster_name or "").strip()
-        full_name = (full_name or "").strip()
-        username = (username or "").strip()
-
-        if roster_name:
-            display_name = roster_name
-        elif full_name:
-            display_name = full_name
-        elif username:
-            display_name = f"@{username}"
-
-    if not display_name:
-        display_name = "there"
-
-    msg = (
-        f"Welcome, {html_escape(display_name)}. You are now registered to receive notifications for Production IG events.\n\n"
-        "Please message Lester (@sc85k) if you run into issues. This bot is under development."
-    )
-
-    if await is_admin(u.id):
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=ADMIN_MENU)
-    else:
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove())
-
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    await upsert_member(u.id, u.username, u.full_name)
-
-    pw = os.getenv("PDIG_ADMIN_PASSWORD", "")
-    if not pw:
-        await update.message.reply_text("Admin password not set on this bot.")
-        return
-
-    if not context.args or context.args[0] != pw:
-        await update.message.reply_text("Wrong password.")
-        return
-
-    await set_admin(u.id, 1)
-    await update.message.reply_text("Admin access granted.", reply_markup=ADMIN_MENU)
-
-
-async def cmd_import_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-    context.user_data["awaiting_roster_csv"] = True
-    await update.message.reply_text(
-        "Upload your roster CSV as a Document.\n\nRequired columns:\n- name\n- username (without @)\n- id (Telegram numeric user_id)",
+    member = result.member
+    await DATABASE.open_events_for_member(member["member_id"], now_local(SETTINGS))
+    await message.reply_text(
+        f"Linked successfully. Welcome, {html.escape(member['name'])}!\n\n"
+        "Your link uses your numeric Telegram account ID, so changing your username will not break it. "
+        "Use /events to view current events.",
+        parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove(),
     )
+    return True
 
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("draft_event", None)
-    context.user_data.pop("awaiting_reason_for_event", None)
-    context.user_data.pop("awaiting_roster_csv", None)
-    await update.message.reply_text(
-        "Cancelled.",
-        reply_markup=ADMIN_MENU if await is_admin(update.effective_user.id) else ReplyKeyboardRemove(),
-    )
-    return ConversationHandler.END
-
-
-# -------------------- roster upload handler --------------------
-async def handle_roster_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_roster_csv"):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
         return
-
-    if not await is_admin(update.effective_user.id):
-        context.user_data.pop("awaiting_roster_csv", None)
-        await update.message.reply_text("Admin only.")
-        return
-
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("Please upload the CSV as a Document.")
-        return
-
-    try:
-        f = await context.bot.get_file(doc.file_id)
-        b = await f.download_as_bytearray()
-        text = b.decode("utf-8-sig", errors="replace")
-        reader = csv.DictReader(io.StringIO(text))
-
-        # Expect: name,username,id
-        batch: list[tuple[int, str, str]] = []
-        for row in reader:
-            name = (row.get("name") or "").strip()
-            username = (row.get("username") or "").strip()
-            tid_raw = (row.get("id") or "").strip()
-            if not tid_raw:
-                continue
-            try:
-                tid = int(tid_raw)
-            except Exception:
-                continue
-            batch.append((tid, username, name))
-
-        imported = await roster_upsert_many(batch)
-        context.user_data.pop("awaiting_roster_csv", None)
-
-        await update.message.reply_text(
-            f"Roster imported/updated: {imported} rows.\n"
-            "Members still must /start once to enroll (Telegram DM rule).",
-            reply_markup=ADMIN_MENU,
-        )
-    except Exception as e:
-        log.exception("Roster import failed")
-        await update.message.reply_text(f"Failed to import CSV: {e}\nTry again or /cancel.")
-
-
-# -------------------- menu router (admin-only) --------------------
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-
-    if text not in {BTN_CREATE, BTN_NOREPLY, BTN_EXPORT, BTN_HELP, BTN_UNENROLLED}:
-        return
-
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
-        return
-
-    if text == BTN_HELP:
-        await update.message.reply_text(
-            "Admin menu:\n"
-            "- Create Event: publish event + DM enrolled members\n"
-            "- No Reply: list defaulters\n"
-            "- Export CSV: export responses\n"
-            "- Un-enrolled users: roster members who haven't /start\n"
-            "- Import roster: /import_members then upload CSV\n\n"
-            "Member flow:\n"
-            "- Coming: you will receive signup link + Form Filled button\n"
-            "- Not Coming: you must provide valid reason\n"
-            "- KIV: bot will nudge until you update",
-            reply_markup=ADMIN_MENU,
-        )
-        return
-
-    if text == BTN_UNENROLLED:
-        rows = await list_unenrolled_roster_rows()
-        if not rows:
-            await update.message.reply_text("All roster users have enrolled (/start).", reply_markup=ADMIN_MENU)
-            return
-
-        lines = []
-        for name, username in rows:
-            handle = f"@{username}" if (username or "").strip() else "(no username)"
-            lines.append(f"{name} — {handle}")
-
-        # Telegram message size limit safety
-        msg = "Un-enrolled users:\n" + "\n".join(lines[:200])
-        if len(lines) > 200:
-            msg += f"\n\n(+{len(lines)-200} more not shown)"
-
-        await update.message.reply_text(msg, reply_markup=ADMIN_MENU)
-        return
-
-    if text == BTN_CREATE:
-        context.user_data["draft_event"] = DraftEvent()
-        await update.message.reply_text("<b>Create Event Wizard</b> — 1/8\nEnter event name", parse_mode=ParseMode.HTML)
-        return CE_NAME
-
-    if text == BTN_NOREPLY:
-        await show_event_picker(update, context, purpose="noreply")
-        return
-
-    if text == BTN_EXPORT:
-        await show_event_picker(update, context, purpose="export")
-        return
-
-
-# -------------------- event picker for noreply/export --------------------
-async def show_event_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, purpose: str):
-    rows = await list_recent_events(limit=10)
-    if not rows:
-        await update.message.reply_text("No events yet.", reply_markup=ADMIN_MENU)
-        return
-
-    buttons = []
-    for event_id, name, start_at_s in rows:
-        start_at = dtparser.parse(start_at_s)
-        label = f"{event_id} — {name} ({start_at.strftime('%d %b %Y')})"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"pick:{purpose}:{event_id}")])
-
-    await update.message.reply_text("Pick an event:", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if not await is_admin(q.from_user.id):
-        await q.message.reply_text("Admin only.")
-        return
-
-    data = q.data or ""
-    m = re.match(r"^pick:(noreply|export):(\d+)$", data)
-    if not m:
-        return
-
-    purpose = m.group(1)
-    event_id = int(m.group(2))
-
-    if purpose == "noreply":
-        await show_noreply(q.message, event_id)
-    else:
-        await export_csv(q.message, event_id)
-
-
-async def show_noreply(message, event_id: int):
-    responses = await get_event_responses(event_id)
-
-    none_list = []
-    kiv_list = []
-    not_coming_no_reason = []
-    coming_no_form = []
-
-    for name, username, uid, status, reason, form_filled in responses:
-        handle = f"@{username}" if username else f"(uid:{uid})"
-        label = f"{name} — {handle}" if name else handle
-
-        if status == STATUS_NONE:
-            none_list.append(label)
-        elif status == STATUS_KIV:
-            kiv_list.append(label)
-        elif status == STATUS_NOT_COMING and len(reason.strip()) < 3:
-            not_coming_no_reason.append(label)
-        elif status == STATUS_COMING and int(form_filled or 0) == 0:
-            coming_no_form.append(label)
-
-    lines = [f"No Reply — Event {event_id}"]
-    if none_list:
-        lines.append("\nNo response:\n" + "\n".join(none_list))
-    if kiv_list:
-        lines.append("\nKIV (needs update):\n" + "\n".join(kiv_list))
-    if coming_no_form:
-        lines.append("\nComing but Form Filled not pressed:\n" + "\n".join(coming_no_form))
-    if not_coming_no_reason:
-        lines.append("\nNot Coming but no reason:\n" + "\n".join(not_coming_no_reason))
-
-    if not (none_list or kiv_list or not_coming_no_reason or coming_no_form):
-        lines.append("\nNo defaulters right now.")
-
-    await message.reply_text("\n".join(lines), reply_markup=ADMIN_MENU)
-
-
-async def export_csv(message, event_id: int):
-    responses = await get_event_responses(event_id)
-    header = "event_id,name,telegram_user_id,username,status,reason,form_filled\n"
-    lines = [header]
-    for name, username, uid, status, reason, form_filled in responses:
-        n = (name or "").replace('"', '""')
-        u = (username or "").replace('"', '""')
-        r = (reason or "").replace('"', '""')
-        lines.append(f'{event_id},"{n}",{uid},"{u}",{status},"{r}",{int(form_filled or 0)}\n')
-
-    csv_bytes = "".join(lines).encode("utf-8")
-    await message.reply_document(
-        document=csv_bytes,
-        filename=f"event_{event_id}_responses.csv",
-        caption=f"Export for event {event_id}",
-    )
-
-
-# -------------------- create event wizard steps --------------------
-async def ce_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    d.name = (update.message.text or "").strip()
-    if len(d.name) < 3:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 1/8\nEnter event name", parse_mode=ParseMode.HTML)
-        return CE_NAME
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 2/8\nEnter event date (YYYY-MM-DD)", parse_mode=ParseMode.HTML)
-    return CE_DATE
-
-
-async def ce_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    d.date_str = (update.message.text or "").strip()
-    try:
-        _ = parse_date(d.date_str)
-    except Exception:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 2/8\nEnter event date (YYYY-MM-DD)", parse_mode=ParseMode.HTML)
-        return CE_DATE
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 3/8\nStart time", parse_mode=ParseMode.HTML)
-    return CE_TIME_START
-
-
-async def ce_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    d.start_time_str = (update.message.text or "").strip()
-    try:
-        _ = parse_time_flexible(d.start_time_str)
-    except Exception:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 3/8\nStart time", parse_mode=ParseMode.HTML)
-        return CE_TIME_START
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 4/8\nEnd time", parse_mode=ParseMode.HTML)
-    return CE_TIME_END
-
-
-async def ce_time_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    d.end_time_str = (update.message.text or "").strip()
-    try:
-        start_at = build_dt(d.date_str, d.start_time_str)
-        end_at = build_dt(d.date_str, d.end_time_str)
-        if end_at <= start_at:
-            await update.message.reply_text("<b>Create Event Wizard</b> — 4/8\nEnd time", parse_mode=ParseMode.HTML)
-            return CE_TIME_END
-    except Exception:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 4/8\nEnd time", parse_mode=ParseMode.HTML)
-        return CE_TIME_END
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 5/8\nVenue", parse_mode=ParseMode.HTML)
-    return CE_VENUE
-
-
-async def ce_venue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    d.venue = (update.message.text or "").strip()
-    if len(d.venue) < 2:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 5/8\nVenue", parse_mode=ParseMode.HTML)
-        return CE_VENUE
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 6/8\nDescription", parse_mode=ParseMode.HTML)
-    return CE_DESC
-
-
-async def ce_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    d.description = (update.message.text or "").strip()
-    if len(d.description) < 3:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 6/8\nDescription", parse_mode=ParseMode.HTML)
-        return CE_DESC
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 7/8\nItems to bring (type - for None)", parse_mode=ParseMode.HTML)
-    return CE_ITEMS
-
-
-async def ce_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    v = (update.message.text or "").strip()
-    if not v:
-        await update.message.reply_text("<b>Create Event Wizard</b> — 7/8\nItems to bring (type - for None)", parse_mode=ParseMode.HTML)
-        return CE_ITEMS
-    d.items_to_bring = "None" if v == "-" else v
-
-    await update.message.reply_text("<b>Create Event Wizard</b> — 8/8\nSignup link (type - if none yet)", parse_mode=ParseMode.HTML)
-    return CE_LINK
-
-
-async def ce_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d: DraftEvent = context.user_data["draft_event"]
-    v = (update.message.text or "").strip()
-    d.signup_url = "" if v == "-" else v
-
-    start_at = build_dt(d.date_str, d.start_time_str)
-    end_at = build_dt(d.date_str, d.end_time_str)
-
-    preview = render_event_message(d, start_at, end_at)
-    if d.signup_url:
-        preview += f"\n\nSignup link:\n{html_escape(d.signup_url)}\n"
-
-    await update.message.reply_text(
-        preview + "\n\nPublish this event?",
-        parse_mode=ParseMode.HTML,
-        reply_markup=confirm_kb(),
-        disable_web_page_preview=True,
-    )
-    return CE_CONFIRM
-
-
-async def ce_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if not await is_admin(q.from_user.id):
-        await q.message.reply_text("Admin only.")
-        return ConversationHandler.END
-
-    if q.data == "ce:cancel":
-        context.user_data.pop("draft_event", None)
-        await q.message.reply_text("Cancelled.", reply_markup=ADMIN_MENU)
-        return ConversationHandler.END
-
-    if q.data != "ce:confirm":
-        return CE_CONFIRM
-
-    d: DraftEvent = context.user_data.get("draft_event")
-    if not d:
-        await q.message.reply_text("Draft missing. Please try again.", reply_markup=ADMIN_MENU)
-        return ConversationHandler.END
-
-    start_at = build_dt(d.date_str, d.start_time_str)
-    end_at = build_dt(d.date_str, d.end_time_str)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            INSERT INTO events (name, start_at, end_at, venue, description, items_to_bring, signup_url, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                d.name,
-                start_at.isoformat(),
-                end_at.isoformat(),
-                d.venue,
-                d.description,
-                d.items_to_bring,
-                d.signup_url,
-                q.from_user.id,
-                now_sg().isoformat(),
-            ),
-        )
-        await db.commit()
-        event_id = cur.lastrowid
-
-    member_ids = await list_enrolled_member_ids()
-    msg = render_event_message(d, start_at, end_at)
-    if d.signup_url:
-        msg += f"\n\nSignup link:\n{html_escape(d.signup_url)}\n"
-
-    for uid in member_ids:
-        await ensure_response_row(event_id, uid)
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-                reply_markup=event_inline_kb(event_id),
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.warning("DM failed to %s: %s", uid, e)
-
-    context.user_data.pop("draft_event", None)
-    await q.message.reply_text(
-        f'Published event "{d.name}".\nEvent ID: {event_id}\nNotified members.',
-        reply_markup=ADMIN_MENU,
-    )
-    return ConversationHandler.END
-
-
-# -------------------- RSVP callbacks + reason capture + form filled --------------------
-async def rsvp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    u = q.from_user
-    await upsert_member(u.id, u.username, u.full_name)
-
-    data = q.data or ""
-    m = re.match(r"^rsvp:(\d+):(NONE|COMING|NOT_COMING|KIV)$", data)
-    if not m:
-        return
-
-    event_id = int(m.group(1))
-    status = m.group(2)
-
-    ev = await get_event(event_id)
-    if not ev:
-        await q.message.reply_text("Event not found.")
-        return
-
-    _, name, _, _, _, _, _, signup_url = ev
-
-    await ensure_response_row(event_id, u.id)
-    await set_status(event_id, u.id, status)
-
-    if status == STATUS_COMING:
-        if signup_url:
-            await q.message.reply_text(
-                f"You selected Coming.\n\nSignup link:\n{signup_url}",
-                reply_markup=form_filled_kb(event_id),
-                disable_web_page_preview=True,
-            )
-        else:
-            await q.message.reply_text(
-                "You selected Coming.\n\nSignup link: (not provided yet)",
-                reply_markup=form_filled_kb(event_id),
-            )
-        return
-
-    if status == STATUS_NOT_COMING:
-        context.user_data["awaiting_reason_for_event"] = event_id
-        await q.message.reply_text(
-            f"You selected Not Coming for {html_escape(name)}.\n<br>\nPlease type your valid reason in ONE message.",
+    user = update.effective_user
+    message = update.effective_message
+    member = await linked_member(update, notify=False)
+    if member is not None:
+        await DATABASE.open_events_for_member(member["member_id"], now_local(SETTINGS))
+        admin_note = "\n\nYou are a configured administrator. Use /admin for organizer commands." if is_bootstrap_admin(user.id) else ""
+        await message.reply_text(
+            f"Welcome back, {html.escape(member['name'])}. You are linked to {html.escape(SETTINGS.group_name)}."
+            f"{admin_note}\n\nUse /events to view current events.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if status == STATUS_KIV:
-        await q.message.reply_text(
-            "You selected KIV.\n\nPlease update later by tapping Coming or Not Coming.\nI will remind you until you update."
+    if context.args:
+        if await complete_link(update, context.args[0]):
+            return
+
+    context.user_data["awaiting_member_id"] = True
+    admin_note = "\nYou are already authorized for organizer commands." if is_bootstrap_admin(user.id) else ""
+    await message.reply_text(
+        f"Welcome to Attenalyst for {SETTINGS.group_name}.\n\n"
+        f"Please enter your {SETTINGS.member_id_label} to link this Telegram account."
+        f"{admin_note}\n\nYour Telegram user ID is {user.id}."
+    )
+
+
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    member = await linked_member(update, notify=False)
+    if member is not None:
+        await update.effective_message.reply_text(
+            f"You are already linked to {member['name']} ({member['member_id']})."
         )
         return
-
-
-async def formfilled_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    u = q.from_user
-    await upsert_member(u.id, u.username, u.full_name)
-
-    data = q.data or ""
-    m = re.match(r"^formfilled:(\d+)$", data)
-    if not m:
+    if context.args:
+        await complete_link(update, context.args[0])
         return
-
-    event_id = int(m.group(1))
-    await ensure_response_row(event_id, u.id)
-    await mark_form_filled(event_id, u.id)
-    await q.message.reply_text("Recorded: Form Filled. Thanks.")
+    context.user_data["awaiting_member_id"] = True
+    await update.effective_message.reply_text(f"Enter your {SETTINGS.member_id_label} in one message.")
 
 
-async def handle_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    event_id = context.user_data.get("awaiting_reason_for_event")
-    if not event_id:
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
         return
-
-    reason = (update.message.text or "").strip()
-    if len(reason) < 3:
-        await update.message.reply_text("Reason too short. Please type a valid reason in ONE message.")
+    member = await linked_member(update, notify=False)
+    user = update.effective_user
+    if member is None:
+        await update.effective_message.reply_text(
+            f"This Telegram account is not linked. Your Telegram user ID is {user.id}. Use /link to continue."
+        )
         return
-
-    await set_reason(int(event_id), update.effective_user.id, reason)
-    context.user_data.pop("awaiting_reason_for_event", None)
-    await update.message.reply_text("Reason recorded. Thanks.")
-
-
-# -------------------- reminders: KIV + Coming-but-not-FormFilled --------------------
-async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    now = now_sg()
-    if in_quiet_hours(now):
-        return
-
-    events = await list_recent_events(limit=50)
-    for event_id, _name, _ in events:
-        ev = await get_event(int(event_id))
-        if not ev:
-            continue
-        _, ev_name, _, _, _, _, _, signup_url = ev
-
-        # KIV nudges
-        kiv_targets = await get_kiv_targets(int(event_id))
-        for uid, last_s in kiv_targets:
-            last = dtparser.parse(last_s) if last_s else None
-            if last and (now - last) < KIV_NUDGE_EVERY:
-                continue
-            try:
-                await context.bot.send_message(
-                    chat_id=int(uid),
-                    text=f'Reminder: your RSVP is still KIV for "{ev_name}". Please update.',
-                    reply_markup=event_inline_kb(int(event_id)),
-                )
-                await set_last_kiv_nudge(int(event_id), int(uid), now)
-            except Exception as e:
-                log.warning("KIV nudge failed to %s: %s", uid, e)
-
-        # Coming but not Form Filled nudges
-        form_targets = await get_form_targets(int(event_id))
-        for uid, last_s in form_targets:
-            last = dtparser.parse(last_s) if last_s else None
-            if last and (now - last) < FORM_NUDGE_EVERY:
-                continue
-
-            try:
-                text = f'Reminder: you selected Coming for "{ev_name}", but you have not pressed Form Filled.'
-                if signup_url:
-                    text += f"\n\nSignup link:\n{signup_url}"
-                await context.bot.send_message(
-                    chat_id=int(uid),
-                    text=text,
-                    reply_markup=form_filled_kb(int(event_id)),
-                    disable_web_page_preview=True,
-                )
-                await set_last_form_nudge(int(event_id), int(uid), now)
-            except Exception as e:
-                log.warning("Form nudge failed to %s: %s", uid, e)
-
-
-# -------------------- main --------------------
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN environment variable.")
-
-    if sys.platform.startswith("win"):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(db_init())
-
-    app = Application.builder().token(token).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("import_members", cmd_import_members))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-
-    # Roster upload
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_roster_upload))
-
-    # Wizard (starts from Create Event button)
-    create_event_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(rf"^{re.escape(BTN_CREATE)}$"), menu_router)],
-        states={
-            CE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_name)],
-            CE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_date)],
-            CE_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_time_start)],
-            CE_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_time_end)],
-            CE_VENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_venue)],
-            CE_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_desc)],
-            CE_ITEMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_items)],
-            CE_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, ce_link)],
-            CE_CONFIRM: [CallbackQueryHandler(ce_confirm, pattern=r"^ce:(confirm|cancel)$")],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
+    await update.effective_message.reply_text(
+        f"Linked identity: {member['name']}\n"
+        f"{SETTINGS.member_id_label.title()}: {member['member_id']}\n"
+        f"Telegram user ID: {user.id}"
     )
-    app.add_handler(create_event_conv, group=0)
 
-    # Admin menu router (other buttons)
-    menu_pattern = rf"^({re.escape(BTN_CREATE)}|{re.escape(BTN_NOREPLY)}|{re.escape(BTN_EXPORT)}|{re.escape(BTN_HELP)}|{re.escape(BTN_UNENROLLED)})$"
-    app.add_handler(MessageHandler(filters.Regex(menu_pattern), menu_router), group=1)
 
-    # Event pickers + RSVP + formfilled
-    app.add_handler(CallbackQueryHandler(pick_callback, pattern=r"^pick:(noreply|export):\d+$"))
-    app.add_handler(CallbackQueryHandler(rsvp_callback, pattern=r"^rsvp:\d+:(NONE|COMING|NOT_COMING|KIV)$"))
-    app.add_handler(CallbackQueryHandler(formfilled_callback, pattern=r"^formfilled:\d+$"))
+async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    member = await linked_member(update)
+    if member is None:
+        return
+    events = await DATABASE.open_events_for_member(member["member_id"], now_local(SETTINGS))
+    if not events:
+        await update.effective_message.reply_text("There are no current events.")
+        return
+    for event in events:
+        status = event["status"].replace("_", " ").title()
+        await update.effective_message.reply_text(
+            render_event(event, SETTINGS) + f"\n\n<b>Your current response:</b> {html.escape(status)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=rsvp_keyboard(int(event["id"])),
+            disable_web_page_preview=True,
+        )
 
-    # Reason capture
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason))
 
-    # Reminder job
-    app.job_queue.run_repeating(reminder_job, interval=600, first=20)
+async def cmd_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    if await linked_member(update) is None:
+        return
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Usage: /reason EVENT_ID your reason")
+        return
+    event_id = int(context.args[0])
+    reason = " ".join(context.args[1:]).strip()
+    if len(reason) < 3:
+        await update.effective_message.reply_text("Please provide a meaningful reason.")
+        return
+    saved = await DATABASE.set_reason(event_id, update.effective_user.id, reason, now_local(SETTINGS))
+    await update.effective_message.reply_text(
+        "Reason recorded. Thank you." if saved else "Select Not Coming for that event before submitting a reason."
+    )
 
-    log.info("Starting bot with polling...")
-    app.run_polling()
+
+async def rsvp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if await linked_member(update) is None:
+        return
+    match = re.fullmatch(r"rsvp:(\d+):(NONE|COMING|NOT_COMING|KIV)", query.data or "")
+    if match is None:
+        return
+    event_id = int(match.group(1))
+    status = match.group(2)
+    event = await DATABASE.event_by_id(event_id)
+    if event is None or not event["active"]:
+        await query.message.reply_text("This event is no longer available.")
+        return
+    if dtparser.parse(event["end_at"]) <= now_local(SETTINGS):
+        await query.message.reply_text("This event has ended.")
+        return
+    if not await DATABASE.set_status(event_id, query.from_user.id, status, now_local(SETTINGS)):
+        await query.message.reply_text("I could not record that response. Use /events and try again.")
+        return
+
+    if status == STATUS_COMING:
+        if event["form_required"]:
+            text = "Recorded: Coming. Please submit the registration form, then acknowledge it below."
+            if event["form_url"]:
+                text += f"\n\nForm: {event['form_url']}"
+            await query.message.reply_text(
+                text,
+                reply_markup=form_keyboard(event_id),
+                disable_web_page_preview=True,
+            )
+        else:
+            await query.message.reply_text("Recorded: Coming. You have completed the required flow.")
+    elif status == STATUS_NOT_COMING:
+        if event["decline_reason_required"]:
+            context.user_data["awaiting_reason_event_id"] = event_id
+            await query.message.reply_text(
+                "Recorded: Not Coming. Please send your reason in one message, or use "
+                f"/reason {event_id} your reason"
+            )
+        else:
+            await query.message.reply_text("Recorded: Not Coming.")
+    elif status == STATUS_KIV:
+        await query.message.reply_text(
+            "Recorded: KIV. I will remind you to change this to Coming or Not Coming before the deadline."
+        )
+
+
+async def form_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if await linked_member(update) is None:
+        return
+    match = re.fullmatch(r"form:(\d+)", query.data or "")
+    if match is None:
+        return
+    saved = await DATABASE.acknowledge_form(
+        int(match.group(1)), query.from_user.id, now_local(SETTINGS)
+    )
+    await query.message.reply_text(
+        "Form submission acknowledged. Your event flow is complete."
+        if saved
+        else "Select Coming before acknowledging the registration form."
+    )
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    await update.effective_message.reply_text(
+        "Organizer commands:\n"
+        "/import_members — upload or update the whitelist CSV\n"
+        "/roster — show linking status\n"
+        "/link_member MEMBER_ID TELEGRAM_ID — prelink an account\n"
+        "/unlink MEMBER_ID — allow an identity to be relinked\n"
+        "/set_active MEMBER_ID yes|no — activate or deactivate a roster identity\n"
+        "/delete_event EVENT_ID — delete an event after confirmation\n"
+        "/restore_event EVENT_ID — restore a deleted event\n"
+        "/outstanding EVENT_ID — show incomplete flows\n"
+        "/export EVENT_ID — export responses\n\n"
+        f"Create events at: {SETTINGS.web_base_url}"
+    )
+
+
+async def cmd_import_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update) or not await require_admin(update):
+        return
+    context.user_data["awaiting_roster_csv"] = True
+    await update.effective_message.reply_text(
+        "Upload a CSV document with these columns:\n"
+        "member_id,name,telegram_user_id,username\n\n"
+        "Only member_id and name are required. telegram_user_id enables instant recognition; otherwise the "
+        f"member links privately using their {SETTINGS.member_id_label}."
+    )
+
+
+async def roster_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("awaiting_roster_csv"):
+        return
+    if not await require_private(update) or not await require_admin(update):
+        context.user_data.pop("awaiting_roster_csv", None)
+        return
+    document = update.effective_message.document
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        content = bytes(await telegram_file.download_as_bytearray()).decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(content))
+        headers = {header.strip() for header in (reader.fieldnames or []) if header}
+        if not {"member_id", "name"}.issubset(headers):
+            raise ValueError("CSV must contain member_id and name columns")
+        rows: list[RosterRow] = []
+        for number, row in enumerate(reader, start=2):
+            member_id = (row.get("member_id") or "").strip()
+            name = (row.get("name") or "").strip()
+            raw_telegram_id = (row.get("telegram_user_id") or "").strip()
+            if not member_id and not name and not raw_telegram_id:
+                continue
+            if not member_id or not name:
+                raise ValueError(f"Row {number} requires member_id and name")
+            telegram_id = None
+            if raw_telegram_id:
+                try:
+                    telegram_id = int(raw_telegram_id)
+                except ValueError as exc:
+                    raise ValueError(f"Row {number} has an invalid telegram_user_id") from exc
+            rows.append(
+                RosterRow(
+                    member_id=member_id,
+                    name=name,
+                    telegram_user_id=telegram_id,
+                    telegram_username=(row.get("username") or "").strip(),
+                )
+            )
+        result = await DATABASE.import_roster(rows, now_local(SETTINGS))
+        context.user_data.pop("awaiting_roster_csv", None)
+        await update.effective_message.reply_text(
+            f"Roster updated: {result.imported} members, {result.prelinked} rows supplied with Telegram IDs.\n"
+            "Prelinked members must still press /start once before the bot can message them."
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        await update.effective_message.reply_text(f"Roster import rejected: {exc}")
+    except Exception:
+        log.exception("Roster import failed")
+        await update.effective_message.reply_text("Roster import failed unexpectedly. Check the server logs.")
+
+
+async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    counts = await DATABASE.roster_counts()
+    issues = await DATABASE.roster_issues()
+    lines = [
+        f"Active roster: {counts['total']}",
+        f"Contactable: {counts['contactable']}",
+        f"Linked but /start not received: {counts['not_started']}",
+        f"Unlinked: {counts['unlinked']}",
+    ]
+    if issues:
+        lines.append("\nNeeds attention:")
+        for row in issues[:100]:
+            lines.append(f"{row['name']} ({row['member_id']}) — {row['issue'].replace('_', ' ').title()}")
+        if len(issues) > 100:
+            lines.append(f"…and {len(issues) - 100} more")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def cmd_link_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /link_member MEMBER_ID TELEGRAM_ID")
+        return
+    try:
+        telegram_id = int(context.args[1])
+    except ValueError:
+        await update.effective_message.reply_text("TELEGRAM_ID must be numeric.")
+        return
+    status = await DATABASE.prelink_member(context.args[0], telegram_id, now_local(SETTINGS))
+    messages = {
+        "linked": "Member prelinked. They must press /start once before receiving messages.",
+        "not_found": "That member ID is not on the active roster.",
+        "already_linked": "That member is already linked. Use /unlink first to replace the account.",
+        "telegram_id_in_use": "That Telegram ID is already linked to another member.",
+    }
+    await update.effective_message.reply_text(messages[status])
+
+
+async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /unlink MEMBER_ID")
+        return
+    removed = await DATABASE.unlink_member(context.args[0], now_local(SETTINGS))
+    await update.effective_message.reply_text(
+        "Telegram account unlinked. Event history remains attached to the member identity."
+        if removed
+        else "That member ID is not on the active roster."
+    )
+
+
+async def cmd_set_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    if len(context.args) != 2 or context.args[1].lower() not in {"yes", "no"}:
+        await update.effective_message.reply_text("Usage: /set_active MEMBER_ID yes|no")
+        return
+    active = context.args[1].lower() == "yes"
+    changed = await DATABASE.set_member_active(context.args[0], active, now_local(SETTINGS))
+    if not changed:
+        await update.effective_message.reply_text("That member ID is not in the roster.")
+        return
+    await update.effective_message.reply_text(
+        "Member activated and eligible for future events."
+        if active
+        else "Member deactivated. Existing history is retained and reminders are stopped."
+    )
+
+
+def _event_id_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if len(context.args) == 1 and context.args[0].isdigit():
+        return int(context.args[0])
+    return None
+
+
+async def cmd_outstanding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    event_id = _event_id_arg(context)
+    if event_id is None:
+        await update.effective_message.reply_text("Usage: /outstanding EVENT_ID")
+        return
+    event = await DATABASE.event_by_id(event_id)
+    if event is None:
+        await update.effective_message.reply_text("Event not found.")
+        return
+    groups = classify_outstanding(event, await DATABASE.event_responses(event_id))
+    labels = {
+        "unreachable": "Unlinked or not started",
+        "no_response": "No response",
+        "kiv": "KIV",
+        "missing_form": "Coming, form not acknowledged",
+        "missing_reason": "Not Coming, reason missing",
+    }
+    lines = [f"Outstanding — {event['name']} (#{event_id})"]
+    for key, label in labels.items():
+        rows = groups[key]
+        if rows:
+            lines.append(f"\n{label} ({len(rows)}):")
+            lines.extend(f"• {row['name']} ({row['member_id']})" for row in rows[:80])
+            if len(rows) > 80:
+                lines.append(f"…and {len(rows) - 80} more")
+    if len(lines) == 1:
+        lines.append("\nEveryone has completed the required flow.")
+    text = "\n".join(lines)
+    for offset in range(0, len(text), 4000):
+        await update.effective_message.reply_text(text[offset : offset + 4000])
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    event_id = _event_id_arg(context)
+    if event_id is None:
+        await update.effective_message.reply_text("Usage: /export EVENT_ID")
+        return
+    event = await DATABASE.event_by_id(event_id)
+    if event is None:
+        await update.effective_message.reply_text("Event not found.")
+        return
+    data = event_csv(event_id, await DATABASE.event_responses(event_id))
+    await update.effective_message.reply_document(
+        document=InputFile(io.BytesIO(data), filename=f"event_{event_id}_responses.csv"),
+        caption=f"Response export for {event['name']}",
+    )
+
+
+async def cmd_delete_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    event_id = _event_id_arg(context)
+    if event_id is None:
+        await update.effective_message.reply_text("Usage: /delete_event EVENT_ID")
+        return
+    event = await DATABASE.event_by_id(event_id)
+    if event is None:
+        await update.effective_message.reply_text("Event not found.")
+        return
+    if not event["active"]:
+        await update.effective_message.reply_text("That event is already deleted.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Delete event", callback_data=f"event_delete:{event_id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"event_delete_cancel:{event_id}"),
+            ]
+        ]
+    )
+    await update.effective_message.reply_text(
+        f"Delete “{event['name']}” (event #{event_id})?\n\n"
+        "Reminders will stop and members will no longer see it. Responses will be retained for export or restoration.",
+        reply_markup=keyboard,
+    )
+
+
+async def delete_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_bootstrap_admin(query.from_user.id):
+        await query.message.reply_text("Administrator access is required.")
+        return
+    match = re.fullmatch(r"event_delete(_cancel)?:(\d+)", query.data or "")
+    if match is None:
+        return
+    await query.edit_message_reply_markup(reply_markup=None)
+    if match.group(1):
+        await query.message.reply_text("Event deletion cancelled.")
+        return
+    event_id = int(match.group(2))
+    event = await DATABASE.event_by_id(event_id)
+    if event is None:
+        await query.message.reply_text("Event not found.")
+        return
+    await DATABASE.set_event_active(event_id, False)
+    await query.message.reply_text(
+        f"Deleted “{event['name']}”. Reminders are stopped and responses are retained.\n"
+        f"Restore it with /restore_event {event_id}."
+    )
+
+
+async def cmd_restore_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    event_id = _event_id_arg(context)
+    if event_id is None:
+        await update.effective_message.reply_text("Usage: /restore_event EVENT_ID")
+        return
+    event = await DATABASE.event_by_id(event_id)
+    if event is None:
+        await update.effective_message.reply_text("Event not found.")
+        return
+    if event["active"]:
+        await update.effective_message.reply_text("That event is already active.")
+        return
+    await DATABASE.set_event_active(event_id, True)
+    await update.effective_message.reply_text(
+        f"Restored “{event['name']}”. Existing responses remain in place and reminders may resume."
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or "").strip()
+    if context.user_data.get("awaiting_member_id"):
+        if await complete_link(update, text):
+            context.user_data.pop("awaiting_member_id", None)
+        return
+    event_id = context.user_data.get("awaiting_reason_event_id")
+    if event_id is not None:
+        if len(text) < 3:
+            await update.effective_message.reply_text("Please provide a meaningful reason.")
+            return
+        saved = await DATABASE.set_reason(
+            int(event_id), update.effective_user.id, text, now_local(SETTINGS)
+        )
+        if saved:
+            context.user_data.pop("awaiting_reason_event_id", None)
+            await update.effective_message.reply_text("Reason recorded. Your event flow is complete.")
+        else:
+            await update.effective_message.reply_text("I could not record that reason. Use /events and try again.")
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_member_id", None)
+    context.user_data.pop("awaiting_reason_event_id", None)
+    context.user_data.pop("awaiting_roster_csv", None)
+    await update.effective_message.reply_text("Cancelled.")
+
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = now_local(SETTINGS)
+    if in_quiet_hours(now, SETTINGS):
+        return
+    for row in await DATABASE.reminder_candidates(now):
+        reminder = reminder_kind(row)
+        if reminder is None:
+            continue
+        column, kind = reminder
+        if not reminder_is_due(row, column, now, SETTINGS):
+            continue
+        event_id = int(row["event_id"])
+        deadline = dtparser.parse(row["rsvp_deadline"]).astimezone(SETTINGS.timezone)
+        overdue = " The response deadline has passed." if now > deadline else ""
+        markup: InlineKeyboardMarkup | None = None
+        if kind == "response":
+            text = f"Reminder: please respond to “{row['event_name']}”.{overdue}"
+            markup = rsvp_keyboard(event_id)
+        elif kind == "KIV response":
+            text = f"Reminder: your response to “{row['event_name']}” is still KIV. Please choose a final answer.{overdue}"
+            markup = rsvp_keyboard(event_id)
+        elif kind == "form acknowledgement":
+            text = f"Reminder: please submit the form for “{row['event_name']}”, then acknowledge it below."
+            if row["form_url"]:
+                text += f"\n\nForm: {row['form_url']}"
+            markup = form_keyboard(event_id)
+        else:
+            text = (
+                f"Reminder: please provide your reason for not attending “{row['event_name']}”.\n"
+                f"Use /reason {event_id} your reason"
+            )
+        try:
+            await context.bot.send_message(
+                chat_id=int(row["telegram_user_id"]),
+                text=text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            await DATABASE.mark_reminded(event_id, row["member_id"], column, now)
+        except Exception:
+            log.exception("Reminder delivery failed for event %s member %s", event_id, row["member_id"])
+
+
+async def post_init(application: Application) -> None:
+    await DATABASE.initialize()
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Link or refresh your membership"),
+            BotCommand("events", "View current events"),
+            BotCommand("whoami", "Check your linked identity"),
+            BotCommand("link", "Link this Telegram account"),
+            BotCommand("reason", "Submit a non-attendance reason"),
+            BotCommand("admin", "Show organizer commands"),
+            BotCommand("cancel", "Cancel the current action"),
+        ]
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled Telegram update error", exc_info=context.error)
+
+
+def build_application(settings: Settings = SETTINGS) -> Application:
+    if not settings.telegram_bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Copy .env.example to .env and configure it.")
+    application = Application.builder().token(settings.telegram_bot_token).post_init(post_init).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("link", cmd_link))
+    application.add_handler(CommandHandler("whoami", cmd_whoami))
+    application.add_handler(CommandHandler("events", cmd_events))
+    application.add_handler(CommandHandler("reason", cmd_reason))
+    application.add_handler(CommandHandler("admin", cmd_admin))
+    application.add_handler(CommandHandler("import_members", cmd_import_members))
+    application.add_handler(CommandHandler("roster", cmd_roster))
+    application.add_handler(CommandHandler("link_member", cmd_link_member))
+    application.add_handler(CommandHandler("unlink", cmd_unlink))
+    application.add_handler(CommandHandler("set_active", cmd_set_active))
+    application.add_handler(CommandHandler("outstanding", cmd_outstanding))
+    application.add_handler(CommandHandler("export", cmd_export))
+    application.add_handler(CommandHandler("delete_event", cmd_delete_event))
+    application.add_handler(CommandHandler("restore_event", cmd_restore_event))
+    application.add_handler(CommandHandler("cancel", cmd_cancel))
+    application.add_handler(CallbackQueryHandler(rsvp_callback, pattern=r"^rsvp:\d+:(NONE|COMING|NOT_COMING|KIV)$"))
+    application.add_handler(CallbackQueryHandler(form_callback, pattern=r"^form:\d+$"))
+    application.add_handler(
+        CallbackQueryHandler(
+            delete_event_callback,
+            pattern=r"^event_delete(_cancel)?:\d+$",
+        )
+    )
+    application.add_handler(MessageHandler(filters.Document.ALL, roster_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_error_handler(error_handler)
+    if application.job_queue is None:
+        raise RuntimeError("Install python-telegram-bot with the job-queue extra")
+    application.job_queue.run_repeating(
+        reminder_job,
+        interval=settings.reminder_check_seconds,
+        first=20,
+        name="outstanding-reminders",
+    )
+    return application
+
+
+def main() -> None:
+    application = build_application()
+    log.info("Starting Attenalyst for %s with Telegram polling", SETTINGS.group_name)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
